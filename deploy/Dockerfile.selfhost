@@ -1,0 +1,32 @@
+# 自托管镜像（单容器：FastAPI 同时提供 /api 与 static SPA）
+#
+# 与仓库根目录 Dockerfile 的差异，只有两点，其余保持一致：
+#   1. 工作目录用 /app（根 Dockerfile 用的是 Render 平台路径 /opt/render/project/src）
+#   2. 安装依赖时剔除 docling —— docling 会拉起 torch 等 GB 级依赖，
+#      2C4G 的小机器装不动；src/core/advanced_parser.py 对 docling 是 try-import 保护的，
+#      缺失时自动回退 pdfplumber/PyPDF2，不影响 PDF 解析主链路。
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libffi-dev curl && rm -rf /var/lib/apt/lists/*
+
+# 依赖层：从 requirements.txt 派生，避免维护第二份清单造成漂移
+COPY requirements.txt .
+RUN grep -v '^docling' requirements.txt > requirements.selfhost.txt \
+    && pip install --no-cache-dir -r requirements.selfhost.txt
+
+COPY . .
+
+RUN mkdir -p data/papers data/figures data/db/chroma
+
+ENV HOST=0.0.0.0
+ENV PORT=8000
+EXPOSE 8000
+
+# 仓库未提供 /api/health，用 SPA 入口 "/" 做存活探测
+HEALTHCHECK --interval=15s --timeout=5s --start-period=90s --retries=6 \
+    CMD curl -fsS http://127.0.0.1:8000/ > /dev/null || exit 1
+
+CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -1,0 +1,38 @@
+# CiteWise V3 自托管编排
+#
+# 前提：同机已有一个 Caddy 边缘容器（smart-scheduler-web-1）占用 80/443，
+# 因此本栈不发布 80/443，只做两件事：
+#   1. 接入边缘 Caddy 所在的外部网络，让 Caddy 能用服务名 citewise 反代
+#   2. 额外暴露 127.0.0.1:5328，仅供服务器本机排障（不对公网开放）
+#
+# 用法：
+#   cd /opt/citewise && sudo docker compose -f deploy/docker-compose.selfhost.yml up -d --build
+services:
+  citewise:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.selfhost
+    image: citewise:selfhost
+    container_name: citewise
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      PORT: "8000"
+    volumes:
+      # 上传的 PDF、SQLite、Chroma 向量库、BM25 索引都在 data/ 下，必须持久化
+      - citewise_data:/app/data
+    networks:
+      edge:
+        aliases:
+          - citewise
+    ports:
+      - "127.0.0.1:5328:8000"
+
+networks:
+  edge:
+    external: true
+    name: smart-scheduler_scheduler
+
+volumes:
+  citewise_data:

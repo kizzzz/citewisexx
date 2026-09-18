@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: citewise-backend
+    runtime: docker
+    plan: free
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: https://open.bigmodel.cn/api/paas/v4/
+      - key: LLM_MODEL
+        value: glm-4.7
+      - key: EMBEDDING_MODEL
+        value: embedding-3
+      - key: EMBEDDING_DIMENSION
+        value: "2048"
+      - key: PORT
+        sync: false

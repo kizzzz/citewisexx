@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.streamlit/secrets.toml
+*.egg-info/
+.venv/
+venv/
+data/
+papers/
+*.db
+*.log
+.chroma/
+.DS_Store
+Thumbs.db
+node_modules/
+.edgeone/

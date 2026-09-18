@@ -1,0 +1,48 @@
+# CiteWise V3 核心依赖
+
+# Web 框架
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+sse-starlette>=1.8.0
+
+# LLM
+openai>=1.6.0
+
+# RAG
+protobuf>=4.25.0,<5.0.0
+chromadb>=0.4.22
+rank-bm25>=0.2.2
+jieba>=0.42.1
+
+# PDF 解析
+PyPDF2>=3.0.1
+pdfplumber>=0.10.0
+docling>=2.0.0
+
+# 数据 & 可视化
+pandas>=2.1.0
+matplotlib>=3.8.0
+openpyxl>=3.1.0
+
+# 文档导出
+python-docx>=1.1.0
+
+# 环境变量
+python-dotenv>=1.0.0
+
+# JWT 签发与校验（P0.3：替换手搓 base64+HMAC 实现）
+pyjwt>=2.8.0
+
+# 联网搜索
+duckduckgo-search>=4.0.0
+
+# HTTP client
+httpx>=0.25.0
+
+# 数值计算
+numpy>=1.24.0
+
+# 多 Agent 编排
+langgraph>=0.2.0
+langchain-core>=0.2.0
