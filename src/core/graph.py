@@ -124,7 +124,7 @@ def responder_node(state: AgentState) -> dict:
     ]
 
     response = llm_client.chat(messages, temperature=0.7)
-    response = annotate_sources(response, chunks, web_results)
+    response = annotate_sources(response, chunks, web_results, state.get("project_id", ""))
 
     citation_check = validate_citations(response, chunks) if chunks else {}
     sources = [

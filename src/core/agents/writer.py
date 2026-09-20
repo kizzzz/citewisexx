@@ -84,7 +84,7 @@ class WriterAgent(BaseAgent):
 
         # 来源标注
         from src.core.source_annotation import annotate_sources, summarize_section
-        content = annotate_sources(content, chunks, [])
+        content = annotate_sources(content, chunks, [], project_id)
         self.think("来源标注完成")
 
         # 保存

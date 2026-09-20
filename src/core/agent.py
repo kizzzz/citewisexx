@@ -407,7 +407,7 @@ class CiteWiseAgent:
         self._think(f"章节生成完成，共 {len(content)} 字")
 
         # 程序化来源标注
-        content = self._annotate_sources(content, chunks, [])
+        content = self._annotate_sources(content, chunks, [], project_id)
         self._think("来源标注完成")
 
         self.pm.save_section(project_id, section_name, content)
@@ -562,10 +562,11 @@ class CiteWiseAgent:
 
     # --- 来源标注（程序化后处理） ---
 
-    def _annotate_sources(self, content: str, rag_chunks: list[dict], web_results: list[dict]) -> str:
+    def _annotate_sources(self, content: str, rag_chunks: list[dict], web_results: list[dict],
+                          project_id: str = "") -> str:
         """程序化标注内容来源 — 委托给独立模块"""
         from src.core.source_annotation import annotate_sources
-        return annotate_sources(content, rag_chunks, web_results)
+        return annotate_sources(content, rag_chunks, web_results, project_id)
 
     # --- 辅助方法 ---
 

@@ -240,6 +240,53 @@ def main():
     log("需求4 子Agent对话(critic→只答不改)", code == 200 and isinstance(body, dict)
         and body.get("type") != "section", f"{code} type={(body or {}).get('type')} len={len((body or {}).get('content') or '')}")
 
+    # --- 新增：正文内联引用核验 + 导出拦截 ---
+    if sid:
+        # 章节生成结果本身：⚠ 引用不得被标为 [KB]
+        bad_kb = [ln for ln in content.split("\n") if "⚠" in ln and ln.strip().startswith("[KB]")]
+        log("引用核验 未核验引用不标KB", not bad_kb, f"bad={bad_kb[:2]}")
+
+        # 干净正文（无引用）→ 导出不应被拦截
+        clean = "本节介绍研究背景与方法设计，此处不包含任何文献引用。"
+        req("PUT", f"/sections/{sid}", {"content": clean}, token)
+        code, body = req("GET", f"/sections/export?project_id={pid}", None, token, timeout=180)
+        log("引用核验 无引用可直接导出", code == 200, f"{code} {str(body)[:120]}")
+
+        # 注入一个知识库里不存在的引用 → 保存报告 + 导出拦截
+        fake_cite = clean + "\n\n已有研究得出相反结论 (Kowalski, 2024)，值得进一步讨论。"
+        code, body = req("PUT", f"/sections/{sid}", {"content": fake_cite}, token)
+        rep = (body or {}).get("citation_report") if isinstance(body, dict) else None
+        log("引用核验 保存返回核验报告",
+            code == 200 and isinstance(rep, dict) and rep.get("unverified") == 1,
+            f"{code} report={rep}")
+
+        code, body = req("POST", f"/sections/{sid}/verify-citations", None, token, timeout=180)
+        marked = (body or {}).get("content", "") if isinstance(body, dict) else ""
+        log("引用核验 接口标记虚构引用", code == 200 and "(Kowalski, 2024)⚠" in marked,
+            f"{code} tail={marked[-80:]!r}")
+
+        code, body = req("GET", f"/sections/export?project_id={pid}", None, token, timeout=180)
+        detail = (body or {}).get("detail") if isinstance(body, dict) else None
+        log("引用核验 导出被拦截(409)",
+            code == 409 and isinstance(detail, dict) and detail.get("code") == "unverified_citations",
+            f"{code} {str(detail)[:200]}")
+
+        code, body = req("GET", f"/sections/export?project_id={pid}&allow_unverified=true",
+                         None, token, timeout=180)
+        raw = body if isinstance(body, str) else str(body)
+        log("引用核验 确认后可导出且带⚠", code == 200 and "⚠" in raw, f"{code} len={len(raw)}")
+
+        # 真实引用不被误伤（Vaswani 2017 已上传到本项目）
+        real_cite = clean + "\n\n该架构完全基于注意力机制 (Vaswani, 2017)。"
+        code, body = req("PUT", f"/sections/{sid}", {"content": real_cite}, token)
+        rep = (body or {}).get("citation_report") if isinstance(body, dict) else None
+        log("引用核验 真实引用不被误标",
+            code == 200 and isinstance(rep, dict) and rep.get("unverified") == 0 and rep.get("verified") == 1,
+            f"{code} report={rep}")
+
+        # 复原章节内容，避免影响后续投递用例
+        req("PUT", f"/sections/{sid}", {"content": content}, token)
+
     # --- 需求5：文献推荐 ---
     t0 = time.time()
     code, body = req("GET", f"/recommendations?project_id={pid}", None, token, timeout=300)

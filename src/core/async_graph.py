@@ -188,6 +188,7 @@ async def async_responder_node(state: AgentState) -> dict:
     intent = state.get("intent", "explore")
     chunks = state.get("chunks", [])
     web_results = state.get("web_results", [])
+    project_id = state.get("project_id", "")
     rag_content = state.get("rag_content", "")
     thinking = list(state.get("thinking_steps", []))
     thinking.append("调用 LLM 生成回答...")
@@ -205,7 +206,7 @@ async def async_responder_node(state: AgentState) -> dict:
         collected_tokens.append(token)
 
     response = "".join(collected_tokens)
-    response = annotate_sources(response, chunks, web_results)
+    response = annotate_sources(response, chunks, web_results, project_id)
 
     citation_check = validate_citations(response, chunks) if chunks else {}
     sources = [
@@ -321,7 +322,7 @@ async def _async_generate_section(section_name, section_topic, research_result,
     async for token in llm_client.achat_stream(messages, temperature=0.7, max_tokens=4000):
         collected_tokens.append(token)
     content = "".join(collected_tokens)
-    content = annotate_sources(content, chunks, [])
+    content = annotate_sources(content, chunks, [], project_id)
 
     project_memory.save_section(project_id, section_name, content)
     summary = summarize_section(llm_client, content)
@@ -469,7 +470,7 @@ async def stream_chat_response(user_input: str, project_id: str,
             )
             full_response = writer_result.get("content", "")
 
-        full_response = annotate_sources(full_response, chunks, web_results)
+        full_response = annotate_sources(full_response, chunks, web_results, project_id)
         content_type = "section"
 
         elapsed = int((time.time() - start_time) * 1000)
@@ -594,7 +595,7 @@ async def stream_chat_response(user_input: str, project_id: str,
             return
 
         full_response = "".join(collected_tokens)
-        full_response = annotate_sources(full_response, chunks, web_results)
+        full_response = annotate_sources(full_response, chunks, web_results, project_id)
         content_type = "text"
 
         elapsed = int((time.time() - start_time) * 1000)

@@ -111,6 +111,7 @@
         .txt-kb:hover { background-color: #eff6ff; }
         .txt-web { color: #16a34a; font-weight: 500; border-bottom: 1px solid #bbf7d0; }
         .txt-ai { color: #7c3aed; }
+        .cite-unverified { color: #dc2626; background-color: #fef2f2; border-bottom: 1px dashed #fca5a5; padding: 0 2px; border-radius: 2px; cursor: help; }
         .cite-sup { font-size: 0.65rem; vertical-align: super; margin-left: 2px; font-weight: 700; color: #3b82f6; opacity: 0.8; }
 
         .nav-item.active {
@@ -654,7 +655,12 @@
             <div id="draftListView" class="flex flex-col h-full overflow-hidden">
                 <header class="h-16 border-b border-slate-200 bg-white flex items-center justify-between px-8">
                     <h2 class="font-bold text-slate-800">章节管理</h2>
-                    <button onclick="toggleModal('newDraftModal')" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-bold">新建章节</button>
+                    <div class="flex gap-2 items-center">
+                        <button onclick="exportDocument()" title="导出全部章节为 Markdown；存在未核验引用时会先拦截并提示" class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-200 flex items-center gap-1">
+                            <i data-lucide="download" class="w-3.5 h-3.5"></i> 导出论文
+                        </button>
+                        <button onclick="toggleModal('newDraftModal')" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-bold">新建章节</button>
+                    </div>
                 </header>
                 <div id="draftList" class="p-8 grid grid-cols-2 gap-6 overflow-y-auto"></div>
             </div>
@@ -680,6 +686,7 @@
                 </header>
                 <div class="flex-1 flex overflow-hidden">
                     <div class="flex-1 p-12 overflow-y-auto paper-scroll bg-white relative">
+                        <div id="citeWarnBar" class="hidden max-w-3xl mx-auto mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-[11px] text-red-700"></div>
                         <div class="max-w-3xl mx-auto mb-3 text-[11px] text-slate-400 flex items-center gap-1.5">
                             <i data-lucide="mouse-pointer-click" class="w-3 h-3"></i>
                             可直接输入修改；也可拖选文字后<strong class="text-slate-500">右键</strong>用自然语言只改选中部分

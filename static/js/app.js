@@ -650,6 +650,8 @@ async function openDraftEditor(id, name) {
         document.getElementById('editableArea').innerText = '加载失败';
     }
 
+    verifyDraftCitations();
+
     // Restore collaborative conversation history (persisted server-side).
     if (id) {
         try {
@@ -805,6 +807,42 @@ function setDraftSaveStatus(text, cls) {
     el.className = `text-[10px] mr-1 ${cls || 'text-slate-400'}`;
 }
 
+// ---- 内联引用核验提示 ----
+function renderCitationWarning(report) {
+    const box = document.getElementById('citeWarnBar');
+    if (!box) return;
+    const unverified = report && report.unverified ? report.unverified : 0;
+    if (!unverified) {
+        box.classList.add('hidden');
+        box.innerHTML = '';
+        return;
+    }
+    const items = (report.items || []).slice(0, 8)
+        .map(c => `<code class="px-1 bg-white/70 rounded text-[10px]">${escapeHtml(c)}</code>`).join(' ');
+    box.innerHTML = `
+        <div class="flex items-start gap-2">
+            <i data-lucide="alert-triangle" class="w-3.5 h-3.5 mt-0.5 shrink-0"></i>
+            <div class="leading-relaxed">
+                <b>${unverified} 处引用无法在本项目知识库中核验</b>（共 ${report.total || 0} 处引用），
+                已用 ⚠ 标出；导出时会被拦截，请删除或补充对应文献后再导出。
+                <div class="mt-1 flex flex-wrap gap-1">${items}</div>
+            </div>
+        </div>`;
+    box.classList.remove('hidden');
+    if (window.lucide) lucide.createIcons();
+}
+
+async function verifyDraftCitations() {
+    if (!currentDraftId) return;
+    try {
+        const res = await api('POST', `/sections/${currentDraftId}/verify-citations`);
+        const data = await res.json();
+        renderCitationWarning(data.citation_report);
+    } catch (e) {
+        /* 核验失败不阻塞编辑 */
+    }
+}
+
 async function saveDraftNow() {
     const editor = document.getElementById('editableArea');
     if (!editor) return;
@@ -814,11 +852,59 @@ async function saveDraftNow() {
     }
     setDraftSaveStatus('保存中...', 'text-slate-400');
     try {
-        await api('PUT', `/sections/${currentDraftId}`, { content: editor.innerText });
+        const res = await api('PUT', `/sections/${currentDraftId}`, { content: editor.innerText });
         setDraftSaveStatus('已保存 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }), 'text-emerald-500');
+        try {
+            const data = await res.json();
+            renderCitationWarning(data.citation_report);
+        } catch (_) { /* 保存已成功，核验报告缺失不影响 */ }
     } catch (e) {
         setDraftSaveStatus('保存失败', 'text-red-500');
         showToast('保存失败: ' + e.message, 'error');
+    }
+}
+
+// ---- 导出论文（未核验引用拦截）----
+async function exportDocument(allowUnverified = false) {
+    if (!currentProjectId) {
+        showToast('请先选择项目', 'error');
+        return;
+    }
+    const url = `${API_BASE}/api/sections/export?project_id=${encodeURIComponent(currentProjectId)}`
+        + (allowUnverified ? '&allow_unverified=true' : '');
+    try {
+        const resp = await fetch(url, {
+            headers: currentUser && currentUser.token ? { 'Authorization': `Bearer ${currentUser.token}` } : {},
+        });
+
+        if (resp.status === 409) {
+            const body = await resp.json();
+            const d = (body && body.detail) || {};
+            const list = (d.unverified || []).slice(0, 10)
+                .map(x => `· ${x.section}：${x.citation}`).join('\n');
+            const ok = confirm(
+                `${d.message || '存在未核验引用'}\n\n${list}\n\n`
+                + '这些引用无法在本项目知识库中找到对应文献，可能是模型编造的。\n'
+                + '点「确定」仍要导出（文中保留 ⚠ 标记），点「取消」返回修改。'
+            );
+            if (ok) await exportDocument(true);
+            return;
+        }
+        if (!resp.ok) throw new Error(await resp.text());
+
+        const blob = await resp.blob();
+        const nameEl = document.getElementById('currentProjectName');
+        const pname = ((nameEl && nameEl.textContent) || 'paper').trim() || 'paper';
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${pname.replace(/\s+/g, '_')}.md`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+        showToast(allowUnverified ? '已导出（含未核验引用标记）' : '导出完成', 'success');
+    } catch (e) {
+        showToast('导出失败: ' + e.message, 'error');
     }
 }
 
@@ -1391,19 +1477,30 @@ function renderCategorizedText(target, fullText) {
     target.classList.add('md-render');
 }
 
+// 把后端标记的未核验引用（引用文本 + ⚠）渲染成红色高亮
+const UNVERIFIED_CITE_RE = /((?:\[[^\[\]\n<>]{1,80}\]|\([^()\n<>]{1,80}\)|（[^（）\n<>]{1,80}）)\s*)?⚠+/g;
+
+function highlightUnverifiedCitations(html) {
+    if (!html || html.indexOf('⚠') === -1) return html;
+    // 单次替换，避免对已包裹的片段二次处理
+    return html.replace(UNVERIFIED_CITE_RE, (m, cite) =>
+        `<span class="cite-unverified" title="该引用无法在本项目知识库中核验，导出前请人工确认">${cite || ''}⚠</span>`
+    );
+}
+
 function renderMarkdown(text) {
     if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
         // Fallback: escape HTML if libraries not loaded
         const div = document.createElement('div');
         div.textContent = text;
-        return div.innerHTML;
+        return highlightUnverifiedCitations(div.innerHTML);
     }
     try {
-        return DOMPurify.sanitize(marked.parse(text.trim()));
+        return highlightUnverifiedCitations(DOMPurify.sanitize(marked.parse(text.trim())));
     } catch (e) {
         const div = document.createElement('div');
         div.textContent = text;
-        return div.innerHTML;
+        return highlightUnverifiedCitations(div.innerHTML);
     }
 }
 

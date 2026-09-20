@@ -183,7 +183,7 @@ class AnalystAgent(BaseAgent):
         content = self.llm.chat(messages, temperature=0.7, max_tokens=4000)
         self.think(f"生成完成: {len(content)} 字")
 
-        content = annotate_sources(content, chunks, [])
+        content = annotate_sources(content, chunks, [], project_id)
         section_id = project_memory.save_section(project_id, section_name, content)
         summary = summarize_section(self.llm, content)
         working_memory.add_section_summary(section_name, summary, len(content))

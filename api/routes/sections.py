@@ -148,7 +148,31 @@ async def update_section(section_id: str, req: SectionUpdate, user: dict = Depen
         raise HTTPException(status_code=404, detail="Section not found")
     verify_project_owner(section["project_id"], user["user_id"])
     project_memory.update_section_by_id(section_id, req.content)
-    return {"status": "ok"}
+
+    # 人工编辑可能引入新的引用，保存时重新核验（只报告，不改写用户文字）
+    citation_report = {}
+    try:
+        from src.core.source_annotation import check_inline_citations
+        _, citation_report = check_inline_citations(req.content, section["project_id"])
+    except Exception as e:
+        logger.warning(f"Inline citation check failed: {e}")
+    return {"status": "ok", "citation_report": citation_report}
+
+
+@router.post("/sections/{section_id}/verify-citations")
+async def verify_section_citations(section_id: str, user: dict = Depends(require_auth)):
+    """按项目知识库核验某章节正文的内联引用"""
+    if not SECTION_ID_PATTERN.match(section_id):
+        raise HTTPException(status_code=400, detail="Invalid section ID format")
+    from src.core.memory import project_memory
+    section = project_memory.get_section_by_id(section_id)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+    verify_project_owner(section["project_id"], user["user_id"])
+
+    from src.core.source_annotation import check_inline_citations
+    marked, report = check_inline_citations(section.get("content", ""), section["project_id"])
+    return {"section_id": section_id, "content": marked, "citation_report": report}
 
 
 @router.delete("/sections/{section_id}")
@@ -165,10 +189,17 @@ async def delete_section(section_id: str, user: dict = Depends(require_auth)):
 
 
 @router.get("/sections/export")
-async def export_document(project_id: str, user: dict = Depends(require_auth)):
-    """导出所有章节为 Markdown 文档"""
+async def export_document(project_id: str, allow_unverified: bool = False,
+                          user: dict = Depends(require_auth)):
+    """导出所有章节为 Markdown 文档
+
+    导出前统一重新核验正文内联引用（人工编辑后的内容也会被重新核验）。
+    只要存在无法在项目知识库中核验的引用，默认拦截导出并返回 409，
+    由调用方确认后带 allow_unverified=true 再次请求。
+    """
     verify_project_owner(project_id, user["user_id"])
     from src.core.memory import project_memory
+    from src.core.source_annotation import UNVERIFIED_MARK, check_inline_citations
 
     sections = project_memory.get_unique_sections(project_id)
     proj = project_memory.get_project(project_id)
@@ -176,8 +207,34 @@ async def export_document(project_id: str, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="Project not found")
 
     doc = f"# {proj['name']}\n\n"
+    total, unverified_items = 0, []
     for s in sections:
-        doc += f"## {s['section_name']}\n\n{s['content']}\n\n---\n\n"
+        content = s["content"]
+        try:
+            content, report = check_inline_citations(content, project_id)
+            total += report.get("total", 0)
+            for item in report.get("items", []):
+                unverified_items.append({"section": s["section_name"], "citation": item})
+        except Exception as e:
+            logger.warning(f"Inline citation check failed on export: {e}")
+        doc += f"## {s['section_name']}\n\n{content}\n\n---\n\n"
+
+    if unverified_items and not allow_unverified:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "unverified_citations",
+                "message": f"检测到 {len(unverified_items)} 处无法在项目知识库中核验的引用，已拦截导出",
+                "total_citations": total,
+                "unverified": unverified_items[:50],
+            },
+        )
+
+    if unverified_items:
+        doc += (
+            f"> 导出提示：本文档含 {len(unverified_items)} 处未能在项目知识库中核验的引用，"
+            f"已用 {UNVERIFIED_MARK} 标记，请人工确认后再对外使用。\n"
+        )
 
     filename = proj["name"].replace(" ", "_")
     return PlainTextResponse(
