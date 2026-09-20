@@ -401,12 +401,24 @@ def _apply_query_rewrite(query: str) -> str:
 # ========== 主检索入口 ==========
 
 def hybrid_search(query: str, top_k: int = RERANK_TOP_K, where: dict = None,
-                  project_id: str = None, intent: str = "explore") -> list[dict]:
+                  project_id: str = None, intent: str = "explore",
+                  allow_global: bool = False) -> list[dict]:
     """混合检索主入口：查询改写 → 多查询 → 向量 + BM25 → RRF 融合 → 重排序
 
     project_id 参数用于按项目过滤：查询 SQLite 获取该项目所有 paper_ids，
     然后构造 ChromaDB where 条件，确保检索结果仅来自当前项目的文献。
+
+    检索范围是数据隔离边界：未显式限定范围时直接拒绝检索，避免串入其他
+    项目/其他用户的文献（既是数据越界，也会让模型生成不存在的引用）。
+    需要全库检索的内部场景必须显式传 allow_global=True。
     """
+    scoped_by_paper = bool(where) and "paper_id" in str(where)
+    if not project_id and not scoped_by_paper and not allow_global:
+        logger.error(
+            "hybrid_search 调用未限定检索范围（缺少 project_id），已拒绝全库检索"
+        )
+        return []
+
     # Phase 3B: 查缓存
     cache_key = query_cache._make_key(query, intent, project_id or "")
     if ENABLE_QUERY_CACHE:

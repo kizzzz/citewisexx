@@ -618,6 +618,8 @@ async function confirmCreateDraft() {
             document.getElementById('editorTitle').textContent = name;
             document.getElementById('editableArea').innerText = result.content;
             document.getElementById('subChatWindow').innerHTML = '<div class="sub-bubble sub-bubble-ai">协作模式已激活。输入指令来修改章节内容。</div>';
+            initSelectionEditor();
+            loadSubAgents();
             lucide.createIcons();
         }
     } catch (e) {
@@ -633,6 +635,9 @@ async function openDraftEditor(id, name) {
     safeClassAction('draftListView', 'add', 'hidden');
     safeClassAction('draftEditor', 'remove', 'hidden');
     document.getElementById('editorTitle').textContent = name;
+    setDraftSaveStatus('');
+    initSelectionEditor();
+    loadSubAgents();
     const subWin = document.getElementById('subChatWindow');
     subWin.innerHTML = '<div class="sub-bubble sub-bubble-ai">协作模式已激活。输入指令来修改章节内容。</div>';
 
@@ -689,6 +694,7 @@ async function clearSectionChats() {
 }
 
 function closeDraftEditor() {
+    hideSelectionMenu();
     safeClassAction('draftListView', 'remove', 'hidden');
     safeClassAction('draftEditor', 'add', 'hidden');
     loadProjectData();
@@ -712,12 +718,14 @@ async function handleSendSubChat() {
 
     try {
         const content = document.getElementById('editableArea').innerText;
+        const agentSel = document.getElementById('subAgentSelect');
         const subBody = {
             message: text,
             project_id: currentProjectId,
             section_name: currentDraftName,
             section_id: currentDraftId || '',
             content: content,
+            agent: agentSel ? agentSel.value : 'auto',
         };
         const activeKey2 = getActiveApiKey();
         if (activeKey2) {
@@ -750,6 +758,221 @@ async function smartExpand() {
     if (!content || !currentProjectId) return;
     document.getElementById('subInput').value = `请续写「${currentDraftName}」章节，在现有内容基础上扩展`;
     handleSendSubChat();
+}
+
+// ============ 章节草稿：三种修改方式 ============
+// 方式一：直接人工修改（contenteditable + 自动/手动保存）
+// 方式二：右侧对话框修改（支持选择子 Agent）
+// 方式三：拖选文字 → 右键 → 自然语言命令，只改选区
+
+let SUB_AGENT_LIST = [
+    { id: 'auto', label: '自动分配' },
+    { id: 'writer', label: '写作 Agent' },
+    { id: 'polisher', label: '润色 Agent' },
+    { id: 'condenser', label: '精简 Agent' },
+    { id: 'expander', label: '扩写 Agent' },
+    { id: 'citation', label: '引用 Agent' },
+    { id: 'critic', label: '审阅 Agent' },
+];
+
+async function loadSubAgents() {
+    try {
+        const resp = await api('GET', '/chat/sub-agents');
+        const data = await resp.json();
+        if (data && Array.isArray(data.agents) && data.agents.length) {
+            SUB_AGENT_LIST = data.agents;
+        }
+    } catch (e) {
+        // 后端不可用时用内置列表兜底，不阻塞编辑
+        console.warn('loadSubAgents fallback:', e.message);
+    }
+    for (const selId of ['subAgentSelect', 'selectionAgentSelect']) {
+        const sel = document.getElementById(selId);
+        if (!sel) continue;
+        const prev = sel.value;
+        sel.innerHTML = SUB_AGENT_LIST.map(a =>
+            `<option value="${escapeHtml(a.id)}" title="${escapeHtml(a.description || '')}">${escapeHtml(a.label)}</option>`
+        ).join('');
+        if (prev && SUB_AGENT_LIST.some(a => a.id === prev)) sel.value = prev;
+    }
+}
+
+// ---- 方式一：手动保存 ----
+function setDraftSaveStatus(text, cls) {
+    const el = document.getElementById('draftSaveStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = `text-[10px] mr-1 ${cls || 'text-slate-400'}`;
+}
+
+async function saveDraftNow() {
+    const editor = document.getElementById('editableArea');
+    if (!editor) return;
+    if (!currentDraftId) {
+        showToast('该章节尚未保存到项目，请先通过「新建章节」生成', 'error');
+        return;
+    }
+    setDraftSaveStatus('保存中...', 'text-slate-400');
+    try {
+        await api('PUT', `/sections/${currentDraftId}`, { content: editor.innerText });
+        setDraftSaveStatus('已保存 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }), 'text-emerald-500');
+    } catch (e) {
+        setDraftSaveStatus('保存失败', 'text-red-500');
+        showToast('保存失败: ' + e.message, 'error');
+    }
+}
+
+// ---- 方式三：选区右键改写 ----
+let selectionState = null; // { text, range, before, after }
+
+function initSelectionEditor() {
+    const editor = document.getElementById('editableArea');
+    if (!editor || editor.dataset.selInit === '1') return;
+    editor.dataset.selInit = '1';
+
+    // 方式一：人工直接修改 —— 输入 1.5s 后自动落库（此前人工编辑不会保存）
+    let autoSaveTimer = null;
+    editor.addEventListener('input', () => {
+        setDraftSaveStatus('未保存', 'text-amber-500');
+        if (autoSaveTimer) clearTimeout(autoSaveTimer);
+        autoSaveTimer = setTimeout(() => {
+            if (currentDraftId) saveDraftNow();
+        }, 1500);
+    });
+    editor.addEventListener('blur', () => {
+        if (autoSaveTimer) clearTimeout(autoSaveTimer);
+        const el = document.getElementById('draftSaveStatus');
+        if (currentDraftId && el && el.textContent === '未保存') saveDraftNow();
+    });
+
+    editor.addEventListener('contextmenu', (e) => {
+        const sel = window.getSelection();
+        const text = sel ? sel.toString() : '';
+        if (!text || !text.trim()) return; // 无选区则走浏览器原生右键
+        e.preventDefault();
+
+        const range = sel.getRangeAt(0).cloneRange();
+        const full = editor.innerText || '';
+        const idx = full.indexOf(text);
+        selectionState = {
+            text: text,
+            range: range,
+            before: idx >= 0 ? full.slice(Math.max(0, idx - 800), idx) : '',
+            after: idx >= 0 ? full.slice(idx + text.length, idx + text.length + 800) : '',
+        };
+
+        const preview = document.getElementById('selectionPreview');
+        if (preview) {
+            preview.textContent = `已选 ${text.length} 字：${text.slice(0, 80)}${text.length > 80 ? '…' : ''}`;
+        }
+        const instr = document.getElementById('selectionInstruction');
+        if (instr) instr.value = '';
+
+        showSelectionMenu(e.clientX, e.clientY);
+    });
+
+    // 点击别处关闭菜单
+    document.addEventListener('mousedown', (e) => {
+        const menu = document.getElementById('selectionMenu');
+        if (!menu || menu.classList.contains('hidden')) return;
+        if (!menu.contains(e.target)) hideSelectionMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') hideSelectionMenu();
+    });
+}
+
+function showSelectionMenu(x, y) {
+    const menu = document.getElementById('selectionMenu');
+    if (!menu) return;
+    menu.classList.remove('hidden');
+    const w = menu.offsetWidth || 288;
+    const h = menu.offsetHeight || 260;
+    menu.style.left = Math.min(x, window.innerWidth - w - 12) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - h - 12) + 'px';
+    lucide.createIcons();
+    const instr = document.getElementById('selectionInstruction');
+    if (instr) setTimeout(() => instr.focus(), 30);
+}
+
+function hideSelectionMenu() {
+    const menu = document.getElementById('selectionMenu');
+    if (menu) menu.classList.add('hidden');
+}
+
+function applySelectionQuick(instruction) {
+    const instr = document.getElementById('selectionInstruction');
+    if (instr) instr.value = instruction;
+    runSelectionEdit();
+}
+
+async function runSelectionEdit() {
+    if (!selectionState || !selectionState.text) {
+        showToast('请先拖选要修改的文字', 'error');
+        return;
+    }
+    const instrEl = document.getElementById('selectionInstruction');
+    const instruction = (instrEl ? instrEl.value : '').trim();
+    if (!instruction) {
+        showToast('请输入修改指令', 'error');
+        return;
+    }
+    const btn = document.getElementById('selectionApplyBtn');
+    const agentSel = document.getElementById('selectionAgentSelect');
+    if (btn) { btn.disabled = true; btn.textContent = '改写中...'; }
+
+    try {
+        const body = {
+            project_id: currentProjectId,
+            section_name: currentDraftName || '',
+            section_id: currentDraftId || '',
+            instruction: instruction,
+            selection: selectionState.text,
+            context_before: selectionState.before,
+            context_after: selectionState.after,
+            agent: agentSel ? agentSel.value : 'auto',
+        };
+        const activeKey = getActiveApiKey();
+        if (activeKey) {
+            body.api_key = activeKey.apiKey;
+            body.base_url = activeKey.baseUrl;
+        }
+        const result = await (await api('POST', '/sections/edit-selection', body)).json();
+        const newText = result.content || '';
+        if (!newText) throw new Error('模型未返回有效结果');
+
+        // 用改写结果替换原选区，保持其余内容不变
+        const range = selectionState.range;
+        range.deleteContents();
+        range.insertNode(document.createTextNode(newText));
+
+        hideSelectionMenu();
+        selectionState = null;
+
+        // 落库（整章内容保存）
+        if (currentDraftId) {
+            await saveDraftNow();
+        } else {
+            setDraftSaveStatus('选区已改写（未落库：章节未创建）', 'text-amber-500');
+        }
+        showToast('选区已按指令改写', 'success');
+
+        // 同步到协作面板，留下可追溯的记录
+        const win = document.getElementById('subChatWindow');
+        if (win) {
+            win.innerHTML += `<div class="sub-bubble sub-bubble-user">【选区改写】${escapeHtml(instruction)}</div>`
+                + `<div class="sub-bubble sub-bubble-ai">已改写 ${selectionStateLength(newText)} 字选区：${escapeHtml(newText.slice(0, 120))}${newText.length > 120 ? '…' : ''}</div>`;
+            win.scrollTop = win.scrollHeight;
+        }
+    } catch (e) {
+        showToast('选区改写失败: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '应用修改'; }
+    }
+}
+
+function selectionStateLength(t) {
+    return (t || '').length;
 }
 
 // ============ Chat ============
@@ -855,8 +1078,13 @@ async function handleSendChat() {
 
                     // Real-time agent timeline in collab bubble
                     if (eventType === 'agent_start' && data.agent) {
-                        appendTimelineStep(collabId + '-timeline', data.agent, 'running', data.detail);
+                        appendTimelineStep(collabId + '-timeline', data.agent, 'running', data.detail,
+                            { parallel: !!data.parallel });
                         updateAgentStatus(data.agent, 'RUNNING');
+                    }
+                    if (eventType === 'agent_thought' && data.agent) {
+                        setTimelineThought(collabId + '-timeline', data.agent, data.thought);
+                        scrollChat();
                     }
                     if (eventType === 'agent_end' && data.agent) {
                         updateTimelineStep(collabId + '-timeline', data.agent, 'done', data.detail, data.duration_ms);
@@ -973,6 +1201,11 @@ function updateAgentStatus(agentName, status) {
         'Researcher': 'research',
         'research': 'research',
         'Responder': null,
+        'Synthesizer': null,
+        'EvidenceAgent': 'research',
+        'MethodAgent': 'analyst',
+        'WebAgent': null,
+        'CriticAgent': null,
         'Writer': 'writing',
         'writing': 'writing',
         'Analyst': 'analyst',
@@ -988,33 +1221,86 @@ function updateAgentStatus(agentName, status) {
 }
 
 // ---- Agent Timeline helpers (inline collab bubble) ----
-function appendTimelineStep(containerId, agent, status, detail) {
+// 每个 Agent 的展示元信息：中文名 + 主色 + 图标
+const AGENT_META = {
+    Supervisor: { label: '调度中枢 Supervisor', color: '#6366f1', icon: 'route' },
+    Researcher: { label: '文献检索 Researcher', color: '#3b82f6', icon: 'search' },
+    EvidenceAgent: { label: '文献证据 Agent', color: '#2563eb', icon: 'book-open' },
+    MethodAgent: { label: '方法与数据 Agent', color: '#10b981', icon: 'flask-conical' },
+    WebAgent: { label: '联网情报 Agent', color: '#f59e0b', icon: 'globe' },
+    CriticAgent: { label: '可靠性审阅 Agent', color: '#ef4444', icon: 'shield-alert' },
+    Synthesizer: { label: '结论收敛 Synthesizer', color: '#8b5cf6', icon: 'git-merge' },
+    Responder: { label: '回答 Responder', color: '#8b5cf6', icon: 'message-square' },
+    Writer: { label: '写作 Writer', color: '#f59e0b', icon: 'pen-line' },
+    Analyst: { label: '分析 Analyst', color: '#10b981', icon: 'bar-chart-3' },
+};
+
+function agentMeta(agent) {
+    return AGENT_META[agent] || { label: agent, color: '#94a3b8', icon: 'bot' };
+}
+
+function appendTimelineStep(containerId, agent, status, detail, opts) {
     const c = document.getElementById(containerId);
     if (!c) return;
     const stepId = containerId + '-' + agent;
     if (document.getElementById(stepId)) return; // already exists
-    const colors = {
-        Supervisor: 'border-indigo-500', Researcher: 'border-blue-500',
-        Responder: 'border-violet-500', Writer: 'border-amber-500', Analyst: 'border-emerald-500',
-    };
-    const cls = status === 'running' ? 'collab-step active' : 'collab-step';
+    const meta = agentMeta(agent);
+    const isParallel = !!(opts && opts.parallel);
+
     const div = document.createElement('div');
     div.id = stepId;
-    div.className = `${cls}`;
-    div.style.borderLeftColor = (colors[agent] || 'border-slate-400').replace('border-', '');
-    div.textContent = `${agent}: ${detail || '处理中...'}`;
+    div.className = status === 'running' ? 'collab-step active' : 'collab-step';
+    div.style.borderLeftColor = meta.color;
+    div.innerHTML = `
+        <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="font-semibold" style="color:${meta.color}">${escapeHtml(meta.label)}</span>
+            ${isParallel ? '<span class="text-[9px] px-1.5 py-0.5 rounded-full bg-white/70 border border-current/20" style="color:' + meta.color + '">并行</span>' : ''}
+            <span class="step-detail">${escapeHtml(detail || '处理中...')}</span>
+            <span class="step-dur text-slate-400 text-[10px]"></span>
+        </div>
+        <div class="step-thought hidden mt-1.5 text-[11px] leading-relaxed text-slate-600 bg-white/70 border border-slate-200 rounded-xl p-2 whitespace-pre-wrap"></div>`;
     c.appendChild(div);
+
+    // 并行组标题：让用户看到"多个 Agent 同时在想"
+    if (isParallel) {
+        const headerId = containerId + '-parallel-header';
+        let header = document.getElementById(headerId);
+        if (!header) {
+            header = document.createElement('div');
+            header.id = headerId;
+            header.className = 'text-[10px] font-bold text-indigo-500/80 tracking-wide mb-1';
+            c.insertBefore(header, div);
+        }
+        const count = c.querySelectorAll('.collab-step[data-parallel="1"]').length + 1;
+        header.textContent = `▸ ${count} 个 Agent 并行研判中`;
+        div.dataset.parallel = '1';
+    }
 }
 
 function updateTimelineStep(containerId, agent, status, detail, durationMs) {
     const stepId = containerId + '-' + agent;
-    const el = document.getElementById(stepId);
+    let el = document.getElementById(stepId);
     if (!el) {
         appendTimelineStep(containerId, agent, status, detail);
-        return;
+        el = document.getElementById(stepId);
+        if (!el) return;
     }
-    el.className = 'collab-step completed';
-    el.textContent = `${agent}: ${detail || '完成'}${durationMs ? ` (${durationMs}ms)` : ''}`;
+    el.classList.remove('active');
+    el.classList.add('completed');
+    const d = el.querySelector('.step-detail');
+    if (d) d.textContent = detail || '完成';
+    const dur = el.querySelector('.step-dur');
+    if (dur && durationMs) dur.textContent = `${durationMs}ms`;
+}
+
+// 渲染某个 Agent 的思考内容（可折叠）
+function setTimelineThought(containerId, agent, thought) {
+    const el = document.getElementById(containerId + '-' + agent);
+    if (!el || !thought) return;
+    const box = el.querySelector('.step-thought');
+    if (!box) return;
+    box.textContent = thought;
+    box.classList.remove('hidden');
 }
 
 async function streamCategorizedText(target, fullText) {
@@ -1287,12 +1573,23 @@ async function loadKnowledgeMap() {
 
     try {
         const data = await (await api('GET', `/knowledge-map?project_id=${currentProjectId}`)).json();
+        if (data.error) {
+            loading.textContent = '知识地图生成异常: ' + data.error;
+            return;
+        }
         if (!data.nodes || data.nodes.length === 0) {
             loading.textContent = '暂无文献，请先上传 PDF';
             return;
         }
+        if (data.nodes.length === 1) {
+            loading.textContent = '仅 1 篇文献，无法生成关系图（至少需要 2 篇）';
+            return;
+        }
         loading.classList.add('hidden');
         renderKnowledgeMap(data);
+        if (!data.edges || data.edges.length === 0) {
+            showToast('已生成节点，但未发现文献间关联（相似度均低于阈值）', 'info');
+        }
     } catch (e) {
         loading.textContent = '加载失败: ' + e.message;
     }
@@ -1309,7 +1606,8 @@ function renderKnowledgeMap(data) {
     svg.attr('viewBox', [0, 0, width, height]);
 
     // Color scale by year
-    const years = data.nodes.map(n => parseInt(n.year) || 2020);
+    const years = data.nodes.map(n => parseInt(n.year)).filter(y => y && y > 1900);
+    if (years.length === 0) years.push(new Date().getFullYear());
     const minYear = Math.min(...years);
     const maxYear = Math.max(...years);
     const colorScale = d3.scaleSequential(d3.interpolateBlues)
@@ -1492,7 +1790,7 @@ async function loadRecommendations() {
     // we're still waiting after 4s, tell the user instead of looking frozen.
     const slowTimer = setTimeout(() => {
         if (!loading.classList.contains('hidden')) {
-            loading.textContent = '正在聚合多源推荐，请稍候...';
+            loading.textContent = '正在聚合文献库 / Semantic Scholar / 联网多源推荐，最长约 30s...';
         }
     }, 4000);
 
@@ -1502,6 +1800,13 @@ async function loadRecommendations() {
         clearTimeout(slowTimer);
         loading.textContent = '加载中...';
         loading.classList.add('hidden');
+
+        // 后端把异常包成 200 + error 字段，前端必须显式暴露，否则用户只看到"暂无推荐"
+        if (data.error) {
+            error.classList.remove('hidden');
+            document.getElementById('recommendErrorMsg').textContent = '推荐服务异常: ' + data.error;
+            return;
+        }
 
         if (!data.recommendations || data.recommendations.length === 0) {
             empty.classList.remove('hidden');
@@ -1943,16 +2248,26 @@ async function loadSessionHistory() {
 
                 if (hasRichData) {
                     // Reconstruct rich layout: timeline card + response + verification
-                    const colors = {
-                        Supervisor: 'border-indigo-500', Researcher: 'border-blue-500',
-                        Responder: 'border-violet-500', Writer: 'border-amber-500', Analyst: 'border-emerald-500',
-                    };
                     let timelineHtml = '';
                     for (const step of timeline) {
-                        const borderColor = (colors[step.agent] || 'border-slate-400').replace('border-', '');
+                        const m = agentMeta(step.agent);
                         const statusCls = step.status === 'done' ? 'collab-step completed' : 'collab-step';
-                        const durText = step.duration_ms ? ` (${step.duration_ms}ms)` : '';
-                        timelineHtml += `<div class="${statusCls}" style="border-left-color:${borderColor}">${step.agent}: ${step.detail || '完成'}${durText}</div>`;
+                        const durText = step.duration_ms ? `<span class="text-slate-400 text-[10px]">${step.duration_ms}ms</span>` : '';
+                        const parallelTag = step.parallel
+                            ? `<span class="text-[9px] px-1.5 py-0.5 rounded-full bg-white/70" style="color:${m.color}">并行</span>`
+                            : '';
+                        const thoughtHtml = step.thought
+                            ? `<div class="mt-1.5 text-[11px] leading-relaxed text-slate-600 bg-white/70 border border-slate-200 rounded-xl p-2 whitespace-pre-wrap">${escapeHtml(step.thought)}</div>`
+                            : '';
+                        timelineHtml += `<div class="${statusCls}" style="border-left-color:${m.color}">
+                            <div class="flex items-center gap-1.5 flex-wrap">
+                                <span class="font-semibold" style="color:${m.color}">${escapeHtml(m.label)}</span>
+                                ${parallelTag}
+                                <span>${escapeHtml(step.detail || '完成')}</span>
+                                ${durText}
+                            </div>
+                            ${thoughtHtml}
+                        </div>`;
                     }
 
                     let coveHtml = '';

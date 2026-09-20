@@ -161,6 +161,13 @@ def _parse_text(filepath: str, filename: str) -> dict:
                     title = stripped[:200]
                 break
 
+        # 清理 Markdown 标题标记，避免入库标题带 "# " 前缀
+        title = re.sub(r'^#{1,6}\s*', '', title).strip().strip('*').strip()
+
+        # 从正文头部抽取作者与年份（此前恒为空/0，导致知识地图节点缺元信息、
+        # 引用匹配与去重完全失效）
+        authors, year = _extract_md_meta(lines[:40])
+
         for line in lines:
             match = md_heading.match(line)
             if match:
@@ -199,12 +206,41 @@ def _parse_text(filepath: str, filename: str) -> dict:
         "paper_id": paper_id,
         "filename": filename,
         "title": title,
-        "authors": "",
-        "year": 0,
+        "authors": authors,
+        "year": year,
         "sections": sections,
         "raw_text": raw_text,
         "figures": [],
     }
+
+
+def _extract_md_meta(head_lines: list) -> tuple:
+    """从 md/txt 头部若干行抽取作者与年份
+
+    只做保守抽取：命中显式字段（作者/Authors/年份/Year）或独立的 4 位年份，
+    抽不到就返回 ("", 0)，绝不猜测。
+    """
+    import re as _re
+
+    authors = ""
+    year = 0
+    for line in head_lines:
+        t = line.strip().lstrip('#').strip()
+        if not t:
+            continue
+        if not authors:
+            m = _re.match(r'^(?:\*\*)?(?:作者|Authors?|Author)(?:\*\*)?\s*[:：]\s*(.+)$', t, _re.IGNORECASE)
+            if m:
+                authors = m.group(1).strip().strip('*')[:200]
+        if not year:
+            m = _re.match(r'^(?:\*\*)?(?:年份|Year|发表年份)(?:\*\*)?\s*[:：]\s*((?:19|20)\d{2})', t, _re.IGNORECASE)
+            if m:
+                year = int(m.group(1))
+            else:
+                m2 = _re.search(r'\b((?:19|20)\d{2})\b', t)
+                if m2 and len(t) <= 60:
+                    year = int(m2.group(1))
+    return authors, year
 
 
 def _parse_xlsx(filepath: str, filename: str) -> dict:

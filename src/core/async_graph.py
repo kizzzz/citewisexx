@@ -3,7 +3,9 @@
 替换 graph.py 中的同步节点为异步节点，
 使 astream_events 能 yield on_chat_model_stream 事件。
 """
+import asyncio
 import logging
+import os
 import time
 
 from langgraph.graph import StateGraph, START, END
@@ -26,6 +28,141 @@ _router = RouterAgent()
 _researcher = ResearchAgent()
 _writer = WriterAgent()
 _analyst = AnalystAgent()
+
+
+def _env_flag(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# 多 Agent 并行研判开关（关闭后退化为单 Responder，省 token）
+ENABLE_AGENT_COLLAB = _env_flag("ENABLE_AGENT_COLLAB", "true")
+# 文献库命中不足时自动联网补充，避免「知识库未涵盖」式拒答
+ENABLE_WEB_FALLBACK = _env_flag("ENABLE_WEB_FALLBACK", "true")
+WEB_FALLBACK_MIN_CHUNKS = int(os.getenv("WEB_FALLBACK_MIN_CHUNKS", "2"))
+# 并行子 Agent 的单次输出上限与超时
+COLLAB_MAX_TOKENS = int(os.getenv("COLLAB_MAX_TOKENS", "320"))
+COLLAB_TIMEOUT = int(os.getenv("COLLAB_TIMEOUT", "40"))
+# 协同使用的轻量模型（默认与主模型解耦，控制成本）
+COLLAB_MODEL = os.getenv("COLLAB_MODEL", "glm-4-flash")
+
+
+# ========== 并行协同研判（多 Agent 同时思考 → Synthesizer 收敛） ==========
+
+_SPECIALIST_LIBRARY = {
+    "EvidenceAgent": {
+        "agent": "EvidenceAgent",
+        "role": "文献证据",
+        "running_detail": "梳理文献证据链...",
+        "system": (
+            "你是文献证据专员。只依据【文献参考材料】提炼与问题直接相关的证据："
+            "关键结论、数据、方法、以及 [作者, 年份] 引用。"
+            "材料不足时直接说明缺什么证据，不要编造文献。"
+        ),
+    },
+    "MethodAgent": {
+        "agent": "MethodAgent",
+        "role": "方法与数据",
+        "running_detail": "分析方法与数据口径...",
+        "system": (
+            "你是方法论与数据分析专员。评估问题涉及的方法选择、实验/统计口径、可比性与潜在偏差，"
+            "给出可操作的分析框架。不得编造数字，缺数据就写明需要什么数据。"
+        ),
+    },
+    "WebAgent": {
+        "agent": "WebAgent",
+        "role": "联网情报",
+        "running_detail": "核对联网检索结果...",
+        "system": (
+            "你是联网情报专员。只依据【网络检索结果】总结最新进展与事实，"
+            "并标注来源标题。没有可用网络结果时，明确说明本次联网无有效信息。"
+        ),
+    },
+    "CriticAgent": {
+        "agent": "CriticAgent",
+        "role": "可靠性审阅",
+        "running_detail": "审阅可靠性与缺口...",
+        "system": (
+            "你是可靠性审阅专员。指出该问题上最容易出错的地方、当前材料无法支撑的结论、"
+            "以及需要用户补充哪些文献才能得到可溯源答案。语气务实，不空话。"
+        ),
+    },
+}
+
+
+def _build_specialists(chunks: list, web_results: list) -> list[dict]:
+    """按当前材料情况选择并行子 Agent（有文献走文献专员，有联网结果加情报专员）"""
+    names = []
+    if chunks:
+        names.append("EvidenceAgent")
+    names.append("MethodAgent")
+    if web_results:
+        names.append("WebAgent")
+    names.append("CriticAgent")
+    return [_SPECIALIST_LIBRARY[n] for n in names]
+
+
+async def _run_specialist(spec: dict, user_input: str, rag_content: str,
+                          web_results: list, api_key: str = None,
+                          base_url: str = None) -> dict | None:
+    """跑单个子 Agent（异步并行调用，短输出）"""
+    from src.core.llm import llm_client
+
+    started = time.time()
+
+    web_block = ""
+    if web_results:
+        web_block = "\n".join(
+            f"- {r.get('title', '')}: {(r.get('snippet') or '')[:220]}" for r in web_results[:5]
+        )
+
+    messages = [
+        {"role": "system", "content": spec["system"]},
+        {"role": "user", "content": (
+            f"## 用户问题\n{user_input}\n\n"
+            f"## 文献参考材料\n{(rag_content or '（本次检索无命中）')[:4000]}\n\n"
+            f"## 网络检索结果\n{web_block or '（无）'}\n\n"
+            f"## 输出要求\n"
+            f"用 3 条以内要点输出你这个角色的核心判断，每条不超过 60 字，总计不超过 180 字。"
+            f"不要复述问题，不要写客套话。"
+        )},
+    ]
+
+    client = llm_client.get_async_client(api_key or None, base_url or None)
+    models = [COLLAB_MODEL] if COLLAB_MODEL else []
+    if llm_client.model not in models:
+        models.append(llm_client.model)
+
+    thought = ""
+    for model_name in models:
+        try:
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=COLLAB_MAX_TOKENS,
+                ),
+                timeout=COLLAB_TIMEOUT,
+            )
+            thought = (resp.choices[0].message.content or "").strip()
+            if thought:
+                break
+        except asyncio.TimeoutError:
+            logger.warning(f"[Collab] {spec['agent']} 超时 {COLLAB_TIMEOUT}s (model={model_name})")
+        except Exception as e:
+            logger.warning(f"[Collab] {spec['agent']} 调用失败 (model={model_name}): {e}")
+
+    if not thought:
+        return None
+
+    first_line = thought.splitlines()[0].strip().lstrip("-•* ")
+    return {
+        "agent": spec["agent"],
+        "role": spec["role"],
+        "thought": thought[:1200],
+        "summary": (first_line[:40] + "…") if len(first_line) > 40 else (first_line or spec["role"]),
+        "duration_ms": int((time.time() - started) * 1000),
+    }
 
 
 # ========== Async Node Functions ==========
@@ -274,15 +411,22 @@ async def stream_chat_response(user_input: str, project_id: str,
     except Exception as e:
         logger.warning(f"RAG 检索失败: {e}")
 
-    # Web search if needed
-    if intent == "websearch":
+    # Web search: 显式联网意图，或文献库命中不足时自动补充（保证不拒答）
+    need_web = (intent == "websearch") or (
+        ENABLE_WEB_FALLBACK and len(chunks) < WEB_FALLBACK_MIN_CHUNKS
+    )
+    if need_web:
         try:
-            from src.tools.web_search import web_search_tool
-            web_results = web_search_tool.search(user_input, max_results=5)
+            from src.tools.web_search import web_search
+            web_results = await asyncio.to_thread(web_search, user_input, 5)
         except Exception as e:
             logger.warning(f"联网搜索失败: {e}")
 
-    research_detail = f"检索完成: {len(chunks)} 文献片段" + (f", {len(web_results)} 网络结果" if web_results else "")
+    research_detail = (
+        f"检索完成: {len(chunks)} 文献片段"
+        + (f", {len(web_results)} 网络结果" if web_results else "")
+        + (" (文献库无命中，已启用联网+模型知识)" if not chunks and need_web else "")
+    )
     research_duration = int((time.time() - start_time) * 1000)
     agent_timeline[-1]["status"] = "done"
     agent_timeline[-1]["detail"] = research_detail
@@ -343,13 +487,88 @@ async def stream_chat_response(user_input: str, project_id: str,
         }, ensure_ascii=False)}
 
     else:
-        # --- Responder path: stream discussion response ---
-        agent_timeline.append({"agent": "Responder", "detail": "生成回答...", "status": "running"})
+        # --- 并行协同研判：多个子 Agent 同时从不同视角分析，再由 Synthesizer 收敛 ---
+        collab_views = []
+        if ENABLE_AGENT_COLLAB:
+            specialists = _build_specialists(chunks, web_results)
+
+            # 1) 同时开跑：前端会看到多个 Agent 并行处于 running 状态
+            for spec in specialists:
+                agent_timeline.append({
+                    "agent": spec["agent"], "detail": spec["running_detail"],
+                    "status": "running", "parallel": True,
+                })
+                yield {"event": "agent_start", "data": json.dumps({
+                    "agent": spec["agent"], "detail": spec["running_detail"],
+                    "parallel": True, "group": "collab",
+                }, ensure_ascii=False)}
+
+            collab_started = time.time()
+            tasks = [
+                asyncio.create_task(_run_specialist(
+                    spec, user_input, rag_content, web_results,
+                    api_key=api_key, base_url=base_url,
+                ))
+                for spec in specialists
+            ]
+
+            # 2) 谁先想完谁先回传，前端按到达顺序渲染思考卡片
+            for finished in asyncio.as_completed(tasks):
+                try:
+                    view = await finished
+                except Exception as e:
+                    logger.warning(f"协同子 Agent 失败: {e}")
+                    continue
+                if not view:
+                    continue
+                collab_views.append(view)
+                for item in agent_timeline:
+                    if item.get("agent") == view["agent"]:
+                        item["status"] = "done"
+                        item["detail"] = view["summary"]
+                        item["duration_ms"] = view["duration_ms"]
+                        item["thought"] = view["thought"]
+                yield {"event": "agent_thought", "data": json.dumps({
+                    "agent": view["agent"],
+                    "role": view["role"],
+                    "thought": view["thought"],
+                    "detail": view["summary"],
+                    "duration_ms": view["duration_ms"],
+                    "group": "collab",
+                }, ensure_ascii=False)}
+                yield {"event": "agent_end", "data": json.dumps({
+                    "agent": view["agent"], "detail": view["summary"],
+                    "duration_ms": view["duration_ms"], "group": "collab",
+                }, ensure_ascii=False)}
+
+            collab_elapsed = int((time.time() - collab_started) * 1000)
+            logger.info(f"[Collab] {len(collab_views)}/{len(specialists)} 个子 Agent 完成，并行耗时 {collab_elapsed}ms")
+
+            # 失败/超时的子 Agent 也要收尾，否则前端时间线永远停在 running
+            done_agents = {v["agent"] for v in collab_views}
+            for spec in specialists:
+                if spec["agent"] in done_agents:
+                    continue
+                for item in agent_timeline:
+                    if item.get("agent") == spec["agent"]:
+                        item["status"] = "done"
+                        item["detail"] = "本轮无有效输出"
+                yield {"event": "agent_end", "data": json.dumps({
+                    "agent": spec["agent"], "detail": "本轮无有效输出", "group": "collab",
+                }, ensure_ascii=False)}
+
+        # --- Responder path: 收敛多视角，流式产出统一结论 ---
+        synth_detail = (
+            f"收敛 {len(collab_views)} 个 Agent 结论..." if collab_views else "生成回答..."
+        )
+        agent_timeline.append({"agent": "Synthesizer", "detail": synth_detail, "status": "running"})
         yield {"event": "agent_start", "data": json.dumps({
-            "agent": "Responder", "detail": "生成回答..."
+            "agent": "Synthesizer", "detail": synth_detail,
         }, ensure_ascii=False)}
 
-        prompt = prompt_engine.build_response_prompt(user_input, rag_content, web_results, intent)
+        prompt = prompt_engine.build_response_prompt(
+            user_input, rag_content, web_results, intent, collab_views=collab_views,
+        )
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_BASE},
@@ -379,12 +598,12 @@ async def stream_chat_response(user_input: str, project_id: str,
         content_type = "text"
 
         elapsed = int((time.time() - start_time) * 1000)
-        responder_detail = f"生成 {len(full_response)} 字"
+        responder_detail = f"统一结论已生成（{len(full_response)} 字）"
         agent_timeline[-1]["status"] = "done"
         agent_timeline[-1]["detail"] = responder_detail
         agent_timeline[-1]["duration_ms"] = elapsed
         yield {"event": "agent_end", "data": json.dumps({
-            "agent": "Responder", "detail": responder_detail,
+            "agent": "Synthesizer", "detail": responder_detail,
             "duration_ms": elapsed,
         }, ensure_ascii=False)}
 

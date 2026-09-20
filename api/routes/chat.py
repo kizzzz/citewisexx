@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sse_starlette.sse import EventSourceResponse
 
 from api.deps import require_auth, verify_project_owner
-from api.schemas import ChatRequest, SubChatRequest, SessionRenameRequest
+from api.schemas import ChatRequest, SubChatRequest, SessionRenameRequest, SelectionEditRequest
 from src.eval.metrics import record_eval
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,43 @@ MAX_MESSAGE_LENGTH = 2000
 
 # 需要监听的 LangGraph 节点名
 _AGENT_NODES = {"supervisor", "researcher", "responder", "writer", "analyst"}
+
+# ---- 章节协作子 Agent（右侧对话框 / 选区改写共用）----
+# key 与前端下拉值一致；auto 表示不加人格约束，走默认路由
+SUB_AGENTS = {
+    "auto": {
+        "label": "自动分配",
+        "persona": "",
+    },
+    "writer": {
+        "label": "写作 Agent",
+        "persona": "你是学术写作 Agent，负责按学术论文规范组织段落与论证逻辑，语言正式、结构清晰。",
+    },
+    "polisher": {
+        "label": "润色 Agent",
+        "persona": "你是学术润色 Agent。只改表达不改论点：优化用词、句式与连接，消除口语化和冗余，保持原意与引用不变。",
+    },
+    "condenser": {
+        "label": "精简 Agent",
+        "persona": "你是精简 Agent。在不丢关键信息与引用的前提下压缩篇幅，删去重复与空话，默认压缩 30% 左右。",
+    },
+    "expander": {
+        "label": "扩写 Agent",
+        "persona": "你是扩写 Agent。在原有论点上补充论证层次、机制解释与必要过渡，不得编造文献、数据或实验结论。",
+    },
+    "citation": {
+        "label": "引用 Agent",
+        "persona": "你是引用规范 Agent。检查并规范 [作者, 年份] 引用格式与位置，标出缺少支撑的论断，禁止编造任何新参考文献。",
+    },
+    "critic": {
+        "label": "审阅 Agent",
+        "persona": "你是学术审阅 Agent。指出逻辑漏洞、证据不足与表述风险，并给出可直接落地的修改方案。",
+    },
+}
+
+
+def _resolve_sub_agent(agent: str) -> dict:
+    return SUB_AGENTS.get((agent or "auto").strip().lower(), SUB_AGENTS["auto"])
 
 
 @router.post("/chat")
@@ -98,13 +135,22 @@ async def sub_chat_endpoint(req: SubChatRequest, user: dict = Depends(require_au
                 logger.warning(f"save_section_chat(user) failed: {e}")
 
         # --- Intent detection -------------------------------------------------
-        intent = _detect_sub_intent(req.message)
+        selected_agent = (getattr(req, "agent", "auto") or "auto").strip().lower()
+        agent_cfg = _resolve_sub_agent(selected_agent)
+        # 显式选择编辑类 Agent 时直接走改写路径；critic 只给评审意见不动正文
+        if selected_agent in ("writer", "polisher", "condenser", "expander", "citation"):
+            intent = "modify"
+        elif selected_agent == "critic":
+            intent = "chat"
+        else:
+            intent = _detect_sub_intent(req.message)
 
         if intent == "modify":
             content, rtype = await asyncio.to_thread(
                 _run_modify_path,
                 req.message, req.content, req.section_name,
                 req.project_id, req.api_key, req.base_url,
+                agent_cfg["persona"],
             )
             # Persist the modified section content.
             if content and rtype != "error":
@@ -118,6 +164,7 @@ async def sub_chat_endpoint(req: SubChatRequest, user: dict = Depends(require_au
                 _run_chat_path,
                 req.message, req.content, req.section_name,
                 req.api_key, req.base_url,
+                agent_cfg["persona"],
             )
 
         # Persist assistant reply (always, even on failure).
@@ -188,7 +235,8 @@ def _detect_sub_intent(message: str) -> str:
 
 
 def _run_modify_path(message: str, content: str, section_name: str,
-                     project_id: str, api_key: str, base_url: str) -> tuple[str, str]:
+                     project_id: str, api_key: str, base_url: str,
+                     persona: str = "") -> tuple[str, str]:
     """Synchronous helper executed in a worker thread.
 
     Uses the LangGraph coordinator with intent=modify so the Writer agent
@@ -196,7 +244,9 @@ def _run_modify_path(message: str, content: str, section_name: str,
     """
     from src.core.agents.coordinator import coordinator
 
+    persona_block = f"【子 Agent 角色】{persona}\n\n" if persona else ""
     augmented_prompt = (
+        f"{persona_block}"
         f"用户正在撰写论文的「{section_name}」章节。\n\n"
         f"当前章节内容：\n{content[:3000]}\n\n"
         f"用户修改指令：{message}\n\n"
@@ -218,7 +268,8 @@ def _run_modify_path(message: str, content: str, section_name: str,
 
 
 def _run_chat_path(message: str, content: str, section_name: str,
-                   api_key: str, base_url: str) -> tuple[str, str]:
+                   api_key: str, base_url: str,
+                   persona: str = "") -> tuple[str, str]:
     """Synchronous helper: answer a Q&A / discussion message WITHOUT touching
     the section content.
 
@@ -230,6 +281,7 @@ def _run_chat_path(message: str, content: str, section_name: str,
     content is never modified by this path.
     """
     from src.core.llm import llm_client, LLMError
+    from src.core.prompt import SYSTEM_PROMPT_BASE
 
     # Apply API key override if the user provided one (same pattern as main chat).
     override_applied = False
@@ -254,11 +306,12 @@ def _run_chat_path(message: str, content: str, section_name: str,
         try:
             reply = llm_client.chat(
                 [
-                    {"role": "system", "content": SYSTEM_PROMPT_BASE},
+                    {"role": "system", "content": (
+                        SYSTEM_PROMPT_BASE + (f"\n\n## 当前子 Agent 角色\n{persona}" if persona else "")
+                    )},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.5,
-                model="glm-4.7",
             )
         except LLMError as e:
             logger.error(f"sub-chat LLM call failed: {e}")
@@ -270,6 +323,108 @@ def _run_chat_path(message: str, content: str, section_name: str,
                 llm_client.clear_override()
             except Exception as clear_err:
                 logger.error(f"Failed to clear LLM override: {clear_err}")
+
+
+@router.get("/chat/sub-agents")
+async def list_sub_agents(user: dict = Depends(require_auth)):
+    """章节协作可选子 Agent 列表（前端下拉框数据源）"""
+    return {
+        "agents": [
+            {"id": key, "label": cfg["label"], "description": cfg["persona"]}
+            for key, cfg in SUB_AGENTS.items()
+        ]
+    }
+
+
+@router.post("/sections/edit-selection")
+async def edit_selection_endpoint(req: SelectionEditRequest, user: dict = Depends(require_auth)):
+    """选区改写 — 只重写用户拖选的文字，不动章节其余部分
+
+    前端流程：拖选文字 → 右键 → 输入自然语言指令 → 调用本接口 → 用返回文本替换选区。
+    章节整体的持久化仍由前端调 PUT /api/sections/{id} 完成，避免后端重复拼接。
+    """
+    verify_project_owner(req.project_id, user["user_id"])
+
+    agent_cfg = _resolve_sub_agent(req.agent)
+
+    def _run() -> tuple[str, str]:
+        from src.core.llm import llm_client, LLMError
+        from src.core.prompt import SYSTEM_PROMPT_BASE
+
+        override_applied = False
+        if req.api_key:
+            try:
+                llm_client.set_override(req.api_key, req.base_url)
+                override_applied = True
+            except Exception:
+                pass
+        try:
+            system = (
+                SYSTEM_PROMPT_BASE
+                + (f"\n\n## 当前子 Agent 角色\n{agent_cfg['persona']}" if agent_cfg["persona"] else "")
+                + "\n\n## 选区改写硬约束\n"
+                  "1. 只输出改写后的选区文本本身，不要输出解释、前后文、标题或 Markdown 代码块\n"
+                  "2. 不得改写选区之外的内容，不得添加与指令无关的新论断\n"
+                  "3. 保留选区内已有的 [作者, 年份] 引用，禁止编造新文献\n"
+                  "4. 保持与前后文语气、时态、术语一致，衔接自然"
+            )
+            prompt = (
+                f"章节：{req.section_name or '未命名章节'}\n\n"
+                f"【选区前文（只读）】\n{req.context_before[-800:] or '（无）'}\n\n"
+                f"【需要修改的选区原文】\n{req.selection}\n\n"
+                f"【选区后文（只读）】\n{req.context_after[:800] or '（无）'}\n\n"
+                f"【用户指令】\n{req.instruction}\n\n"
+                f"请只输出改写后的选区文本。"
+            )
+            try:
+                out = llm_client.chat(
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.4,
+                    max_tokens=min(4000, max(400, len(req.selection) * 3)),
+                )
+            except LLMError as e:
+                logger.error(f"edit-selection LLM failed: {e}")
+                return "", "error"
+            return (out or "").strip(), "selection"
+        finally:
+            if override_applied:
+                try:
+                    llm_client.clear_override()
+                except Exception as clear_err:
+                    logger.error(f"Failed to clear LLM override: {clear_err}")
+
+    if not req.instruction.strip() or not req.selection.strip():
+        raise HTTPException(status_code=422, detail="instruction 与 selection 均不能为空")
+
+    start_time = time.time()
+    try:
+        new_text, rtype = await asyncio.to_thread(_run)
+    except Exception as e:
+        logger.error(f"edit-selection error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="选区改写失败，请稍后重试")
+
+    if not new_text or rtype == "error":
+        raise HTTPException(status_code=502, detail="模型未返回有效改写结果，请调整指令后重试")
+
+    # 去掉模型偶发包裹的代码块标记
+    if new_text.startswith("```"):
+        new_text = new_text.strip("`")
+        if "\n" in new_text:
+            new_text = new_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+    logger.info(
+        f"[EditSelection] agent={req.agent} in={len(req.selection)} out={len(new_text)} "
+        f"cost={int((time.time() - start_time) * 1000)}ms"
+    )
+    return {
+        "content": new_text,
+        "original": req.selection,
+        "agent": req.agent,
+        "type": "selection",
+    }
 
 
 # --- Session Management ---

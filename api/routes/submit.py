@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Depends
 
-from api.deps import require_auth
+from api.deps import require_auth, verify_project_owner
 from api.schemas import JournalRecommendRequest, FormatCheckRequest, FormatApplyRequest
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,7 @@ async def recommend_journals_endpoint(req: JournalRecommendRequest, user: dict =
     """获取期刊推荐"""
     if not req.project_id or not req.project_id.strip():
         raise HTTPException(status_code=422, detail="project_id must not be empty")
+    verify_project_owner(req.project_id, user["user_id"])
     try:
         from src.core.submit import recommend_journals
         result = await asyncio.to_thread(
@@ -37,6 +38,7 @@ async def format_check_endpoint(req: FormatCheckRequest, user: dict = Depends(re
         raise HTTPException(status_code=422, detail="project_id must not be empty")
     if not req.journal_name or not req.journal_name.strip():
         raise HTTPException(status_code=422, detail="journal_name must not be empty")
+    verify_project_owner(req.project_id, user["user_id"])
     try:
         from src.core.submit import check_format
         result = await asyncio.to_thread(
@@ -55,6 +57,7 @@ async def format_apply_endpoint(req: FormatApplyRequest, user: dict = Depends(re
     """应用格式修改"""
     if not req.project_id or not req.project_id.strip():
         raise HTTPException(status_code=422, detail="project_id must not be empty")
+    verify_project_owner(req.project_id, user["user_id"])
     try:
         from src.core.submit import apply_format_changes
         result = await asyncio.to_thread(

@@ -58,6 +58,19 @@ async def get_knowledge_map(
     # the first hit). Threshold lowered from 0.5 to 0.35 so graphs are denser
     # and actually show relationships between papers in the same sub-field.
     edges = []
+    # 相似度是对称的，A→B 与 B→A 是同一条边；此前两条都入库，
+    # 前端画出重复连线、边数虚高一倍。用无向去重键收敛。
+    seen_edges: set = set()
+
+    def _add_edge(src: str, dst: str, etype: str, weight: float) -> None:
+        if src == dst:
+            return
+        key = (etype, src, dst) if etype == "citation" else (etype, *sorted((src, dst)))
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        edges.append({"source": src, "target": dst, "type": etype, "weight": weight})
+
     try:
         embeddings = get_paper_embeddings(project_id)
         if embeddings and len(embeddings) >= 2:
@@ -65,12 +78,7 @@ async def get_knowledge_map(
             for pid, similar in sim_matrix.items():
                 for other_pid, score in similar:
                     if score >= 0.35:
-                        edges.append({
-                            "source": pid,
-                            "target": other_pid,
-                            "type": "similarity",
-                            "weight": round(score, 3),
-                        })
+                        _add_edge(pid, other_pid, "similarity", round(score, 3))
     except Exception as e:
         logger.warning(f"Similarity edges failed: {e}")
 
@@ -81,12 +89,7 @@ async def get_knowledge_map(
             citation_graph = build_citation_graph(project_id)
             for pid, cited_set in citation_graph.items():
                 for cited_pid in cited_set:
-                    edges.append({
-                        "source": pid,
-                        "target": cited_pid,
-                        "type": "citation",
-                        "weight": 1.0,
-                    })
+                    _add_edge(pid, cited_pid, "citation", 1.0)
         except Exception as e:
             logger.warning(f"Citation edges failed: {e}")
 

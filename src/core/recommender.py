@@ -1,6 +1,7 @@
 """智能文献推荐 — 基于语义相似度和引用关系"""
 import json
 import logging
+import os
 import re
 import numpy as np
 import time
@@ -20,19 +21,25 @@ _KNOWLEDGE_MAP_CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
-def _cache_get(cache: dict, key: str):
+def _cache_get(cache: dict, key: str, ttl: float = None):
     entry = cache.get(key)
     if not entry:
         return None
     ts, value = entry
-    if time.time() - ts > _CACHE_TTL_SECONDS:
+    effective_ttl = ttl if ttl is not None else _CACHE_TTL_SECONDS
+    if time.time() - ts > effective_ttl:
         cache.pop(key, None)
         return None
     return value
 
 
-def _cache_set(cache: dict, key: str, value) -> None:
-    cache[key] = (time.time(), value)
+def _cache_set(cache: dict, key: str, value, ttl: float = None) -> None:
+    """Store value; ttl 仅用于降级结果的短缓存（通过提前设置更旧的时间戳实现）"""
+    if ttl is not None and ttl < _CACHE_TTL_SECONDS:
+        # 让该条目提前过期：把时间戳往前挪
+        cache[key] = (time.time() - (_CACHE_TTL_SECONDS - ttl), value)
+    else:
+        cache[key] = (time.time(), value)
 
 
 def invalidate_project_cache(project_id: str) -> None:
@@ -134,32 +141,58 @@ def extract_citations(text: str) -> list[str]:
     return list(set(matches))
 
 
+def _normalize_for_match(text: str) -> str:
+    """标题/正文匹配用的归一化：去 Markdown 标记、压缩空白、小写"""
+    if not text:
+        return ""
+    t = re.sub(r'[#*`_>\[\]]+', ' ', text)
+    t = re.sub(r'\s+', ' ', t)
+    return t.strip().lower()
+
+
+def _clean_query_title(title: str) -> str:
+    """清理标题用于外部检索：去 Markdown 标记与特殊符号
+
+    Semantic Scholar 对 '#'、'*' 等字符敏感，带 '# ' 前缀的标题会导致查询
+    命中率骤降（线上表现为 0 条外部推荐）。
+    """
+    if not title:
+        return ""
+    t = re.sub(r'[#*`_\[\]{}|\\]+', ' ', title)
+    t = re.sub(r'\s+', ' ', t)
+    return t.strip()[:200]
+
+
 def build_citation_graph(project_id: str) -> dict[str, set[str]]:
-    """Build a citation graph from paper full texts."""
+    """Build a citation graph from paper full texts.
+
+    匹配前对标题与正文做归一化（去 Markdown 标记 / 压缩空白 / 小写），
+    否则入库标题带 "# " 前缀或换行差异时，引用边会恒为 0。
+    """
     papers = project_memory.get_papers(project_id)
     graph = {}
 
+    norm_text = {p["id"]: _normalize_for_match(p.get("raw_text", "") or "") for p in papers}
+
     for paper in papers:
         pid = paper["id"]
-        title = paper.get("title", "")
-        authors = paper.get("authors", "")
-        full_text = paper.get("raw_text", "") or ""
+        full_text = norm_text.get(pid, "")
 
         # This paper cites others
         cited = set()
-        for other in papers:
-            if other["id"] == pid:
-                continue
-            other_title = other.get("title", "")
-            other_authors = other.get("authors", "")
-            # Check if other paper is referenced
-            if other_title and other_title in full_text:
-                cited.add(other["id"])
-            elif other_authors:
-                # Check by author name
-                first_author = other_authors.split(",")[0].strip()
-                if first_author and first_author in full_text:
+        if full_text:
+            for other in papers:
+                if other["id"] == pid:
+                    continue
+                other_title = _normalize_for_match(other.get("title", ""))
+                other_authors = other.get("authors", "")
+                # 标题匹配：至少 8 个字符才算有效信号，避免 "全文" 这类泛标题误命中
+                if other_title and len(other_title) >= 8 and other_title in full_text:
                     cited.add(other["id"])
+                elif other_authors:
+                    first_author = _normalize_for_match(other_authors.split(",")[0])
+                    if first_author and len(first_author) >= 2 and first_author in full_text:
+                        cited.add(other["id"])
 
         graph[pid] = cited
 
@@ -286,7 +319,7 @@ def _semantic_scholar_recommendations(papers: list[dict], top_k: int) -> list[di
             # Search Semantic Scholar for related papers
             url = "https://api.semanticscholar.org/graph/v1/paper/search"
             params = {
-                "query": title[:200],
+                "query": _clean_query_title(title),
                 "limit": top_k + 2,
                 "fields": "title,authors,year,citationCount,abstract,url",
             }
@@ -353,7 +386,10 @@ async def _semantic_scholar_recommendations_async(
     }
 
     async def _one(client: httpx.AsyncClient, title: str) -> list[dict]:
-        params = {**base_params, "query": title[:200]}
+        clean = _clean_query_title(title)
+        if not clean:
+            return []
+        params = {**base_params, "query": clean}
         try:
             resp = await client.get(url, params=params, headers=headers, timeout=per_query_timeout)
             if resp.status_code != 200:
@@ -439,7 +475,7 @@ def _fallback_from_existing_papers(papers: list[dict], top_k: int) -> list[dict]
 
 
 async def get_recommendations_async(
-    project_id: str, top_k: int = 5, total_timeout: float = 15.0
+    project_id: str, top_k: int = 5, total_timeout: float = None
 ) -> list[dict]:
     """Async orchestrator: runs three sources in parallel, merges + dedups.
 
@@ -457,6 +493,9 @@ async def get_recommendations_async(
     as all three finish OR ``total_timeout`` elapses (partial result then).
     """
     import asyncio
+
+    if total_timeout is None:
+        total_timeout = float(os.getenv("RECOMMEND_TIMEOUT", "28"))
 
     cached = _cache_get(_REC_CACHE, project_id)
     if cached is not None:
@@ -486,21 +525,38 @@ async def get_recommendations_async(
             logger.warning(f"LLM fallback failed: {e}")
             return []
 
-    internal_recs: list[dict] = []
-    external_recs: list[dict] = []
-    llm_recs: list[dict] = []
-    try:
-        internal_recs, external_recs, llm_recs = await asyncio.wait_for(
-            asyncio.gather(_internal(), _external(), _llm_external(), return_exceptions=False),
-            timeout=total_timeout,
-        )
-    except asyncio.TimeoutError:
+    # 用 asyncio.wait 而不是 wait_for(gather(...))：后者超时会取消全部任务，
+    # 已经跑完的来源结果也会一起丢掉（线上表现为只剩降级结果）。
+    tasks = {
+        "internal": asyncio.create_task(_internal()),
+        "semantic_scholar": asyncio.create_task(_external()),
+        "llm": asyncio.create_task(_llm_external()),
+    }
+    done, pending = await asyncio.wait(tasks.values(), timeout=total_timeout)
+
+    results: dict[str, list[dict]] = {}
+    for name, task in tasks.items():
+        if task in done and not task.cancelled():
+            try:
+                results[name] = task.result() or []
+            except Exception as e:
+                logger.warning(f"Recommendation source {name} failed: {e}")
+                results[name] = []
+        else:
+            results[name] = []
+
+    for task in pending:
+        task.cancel()
+    if pending:
+        timed_out = [n for n, t in tasks.items() if t in pending]
         logger.warning(
-            f"Recommendation gather timed out after {total_timeout}s for {project_id}; "
-            f"returning partial results (internal={len(internal_recs)}, external={len(external_recs)}, llm={len(llm_recs)})"
+            f"Recommendation sources timed out after {total_timeout}s for {project_id}: {timed_out}; "
+            f"keeping partial results from {[n for n in results if results[n]]}"
         )
-    except Exception as e:
-        logger.warning(f"Recommendation gather failed: {e}")
+
+    internal_recs = results["internal"]
+    external_recs = results["semantic_scholar"]
+    llm_recs = results["llm"]
 
     # Merge + dedup. Prefer higher-scored items; LLM recommendations get a
     # small bonus so they surface above low-similarity internal hits.
@@ -529,10 +585,16 @@ async def get_recommendations_async(
 
     # Final safety net: if literally nothing came back, recommend existing
     # papers so the UI is never stuck on "loading".
+    degraded = False
     if not merged:
         merged = _fallback_from_existing_papers(papers, top_k)
+        degraded = True
+    elif not external_recs and not llm_recs:
+        # 只有内部相似度，说明外部来源全挂/超时，不应长时间缓存
+        degraded = True
 
-    _cache_set(_REC_CACHE, project_id, merged)
+    # 降级结果只缓存 60s，避免一次超时把用户锁在低质量推荐上 10 分钟
+    _cache_set(_REC_CACHE, project_id, merged, ttl=60 if degraded else None)
     return merged[: top_k * max(len(papers), 1)]
 
 

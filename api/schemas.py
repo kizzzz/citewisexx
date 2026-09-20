@@ -17,6 +17,21 @@ class SubChatRequest(BaseModel):
     section_name: str = Field(..., min_length=1, description="章节名称")
     section_id: str = Field("", description="章节 ID（持久化协作面板对话用）")
     content: str = Field("", description="当前章节内容")
+    agent: str = Field("auto", description="指定子 Agent：auto/writer/polisher/condenser/expander/citation/critic")
+    api_key: str = Field("", description="用户自带 API Key（可选）")
+    base_url: str = Field("", description="用户自定义 Base URL（可选）")
+
+
+class SelectionEditRequest(BaseModel):
+    """选区自然语言改写（拖选文字 → 右键 → 输入指令 → 只改选区）"""
+    project_id: str = Field(..., min_length=1, description="项目ID")
+    section_name: str = Field("", max_length=200, description="章节名称")
+    section_id: str = Field("", description="章节 ID")
+    instruction: str = Field(..., min_length=1, max_length=1000, description="自然语言修改指令")
+    selection: str = Field(..., min_length=1, max_length=6000, description="用户选中的原文")
+    context_before: str = Field("", max_length=2000, description="选区前文（保持衔接用）")
+    context_after: str = Field("", max_length=2000, description="选区后文（保持衔接用）")
+    agent: str = Field("auto", description="指定子 Agent")
     api_key: str = Field("", description="用户自带 API Key（可选）")
     base_url: str = Field("", description="用户自定义 Base URL（可选）")
 

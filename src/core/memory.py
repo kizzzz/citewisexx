@@ -427,14 +427,34 @@ class ProjectMemory:
     # --- 生成记录 ---
     def save_section(self, project_id: str, section_name: str,
                      content: str, citations: list = None) -> str:
-        sid = f"sec_{uuid.uuid4().hex[:8]}"
+        """保存章节：同项目同名章节做覆盖更新（返回原 id）
+
+        此前每次保存都 INSERT 新行，导致：
+        - 章节列表出现同名重复项；
+        - 前端持有的 section_id 变成历史版本，人工编辑/PUT 保存后
+          「看起来没生效」（实际写到了旧行）。
+        """
+        citations_json = json.dumps(citations or [], ensure_ascii=False)
         with self._get_conn() as conn:
-            conn.execute(
-                "INSERT INTO generated_sections (id, project_id, section_name, content, word_count, citations) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (sid, project_id, section_name, content, len(content),
-                 json.dumps(citations or [], ensure_ascii=False))
-            )
+            existing = conn.execute(
+                "SELECT id FROM generated_sections WHERE project_id=? AND section_name=? "
+                "ORDER BY generated_at DESC LIMIT 1",
+                (project_id, section_name),
+            ).fetchone()
+            if existing:
+                sid = existing["id"]
+                conn.execute(
+                    "UPDATE generated_sections SET content=?, word_count=?, citations=?, "
+                    "generated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (content, len(content), citations_json, sid),
+                )
+            else:
+                sid = f"sec_{uuid.uuid4().hex[:8]}"
+                conn.execute(
+                    "INSERT INTO generated_sections (id, project_id, section_name, content, word_count, citations) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (sid, project_id, section_name, content, len(content), citations_json)
+                )
             conn.commit()
         return sid
 

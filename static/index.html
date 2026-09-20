@@ -488,7 +488,12 @@
 
             <header class="h-16 border-b border-slate-200 bg-white/50 backdrop-blur-md flex items-center justify-between px-8">
                 <div class="flex items-center gap-4">
-                    <h2 class="font-bold text-slate-800">多 Agent 协同中心</h2>
+                    <div class="flex items-center gap-2.5">
+                        <span class="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-md shadow-indigo-200">
+                            <i data-lucide="workflow" class="w-4 h-4 text-white"></i>
+                        </span>
+                        <h2 class="font-bold text-slate-800">协同中心</h2>
+                    </div>
                 </div>
                 <div class="flex items-center gap-4 text-xs font-medium">
                     <div class="flex items-center gap-3 text-slate-400">
@@ -662,7 +667,11 @@
                         </button>
                         <h3 id="editorTitle" class="text-sm font-bold text-slate-800">编辑</h3>
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex gap-2 items-center">
+                        <span id="draftSaveStatus" class="text-[10px] text-slate-400 mr-1"></span>
+                        <button onclick="saveDraftNow()" title="手动保存当前章节（人工修改方式）" class="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-200 transition-all flex items-center gap-1">
+                            <i data-lucide="save" class="w-3.5 h-3.5"></i> 保存
+                        </button>
                         <button onclick="clearSectionChats()" title="清空当前章节协作面板的全部对话（章节内容会保留）" class="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-200 transition-all flex items-center gap-1">
                             <i data-lucide="refresh-ccw" class="w-3.5 h-3.5"></i> 新对话
                         </button>
@@ -670,7 +679,11 @@
                     </div>
                 </header>
                 <div class="flex-1 flex overflow-hidden">
-                    <div class="flex-1 p-12 overflow-y-auto paper-scroll bg-white">
+                    <div class="flex-1 p-12 overflow-y-auto paper-scroll bg-white relative">
+                        <div class="max-w-3xl mx-auto mb-3 text-[11px] text-slate-400 flex items-center gap-1.5">
+                            <i data-lucide="mouse-pointer-click" class="w-3 h-3"></i>
+                            可直接输入修改；也可拖选文字后<strong class="text-slate-500">右键</strong>用自然语言只改选中部分
+                        </div>
                         <div id="editableArea" contenteditable="true" class="max-w-3xl mx-auto text-slate-700 leading-loose text-lg outline-none min-h-full"></div>
                     </div>
                     <div class="w-96 border-l border-slate-200 bg-slate-50/50 flex flex-col">
@@ -684,6 +697,12 @@
                         <div id="materialsPanel" class="hidden px-4 py-2 space-y-2 max-h-40 overflow-y-auto border-b border-slate-200"></div>
                         <div id="subChatWindow" class="flex-1 p-4 overflow-y-auto sub-chat-scroll space-y-4"></div>
                         <div class="p-4 bg-white border-t border-slate-200">
+                            <div class="flex items-center gap-2 mb-2">
+                                <label class="text-[10px] font-bold text-slate-400 shrink-0">子 Agent</label>
+                                <select id="subAgentSelect" class="flex-1 bg-slate-100 border-none rounded-lg px-2 py-1.5 text-[11px] outline-none focus:ring-2 focus:ring-blue-500">
+                                    <option value="auto">自动分配</option>
+                                </select>
+                            </div>
                             <div class="relative">
                                 <textarea id="subInput" rows="2" placeholder="指令修稿..." class="w-full bg-slate-100 border-none rounded-xl p-3 text-xs focus:ring-2 focus:ring-blue-500 resize-none outline-none"></textarea>
                                 <button onclick="handleSendSubChat()" class="absolute right-2 bottom-2 p-2 bg-blue-600 text-white rounded-lg">
@@ -692,6 +711,33 @@
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- 选区右键菜单：拖选文字 → 右键 → 自然语言只改选区 -->
+            <div id="selectionMenu" class="hidden fixed z-[80] w-72 bg-white rounded-2xl shadow-2xl border border-slate-200 p-3">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-[11px] font-bold text-slate-700 flex items-center gap-1">
+                        <i data-lucide="wand-2" class="w-3.5 h-3.5 text-indigo-500"></i> 修改选中文字
+                    </span>
+                    <button onclick="hideSelectionMenu()" class="text-slate-400 hover:text-slate-600">
+                        <i data-lucide="x" class="w-3.5 h-3.5"></i>
+                    </button>
+                </div>
+                <div id="selectionPreview" class="text-[10px] text-slate-400 bg-slate-50 rounded-lg p-2 mb-2 max-h-16 overflow-hidden"></div>
+                <select id="selectionAgentSelect" class="w-full bg-slate-100 border-none rounded-lg px-2 py-1.5 text-[11px] mb-2 outline-none focus:ring-2 focus:ring-indigo-500">
+                    <option value="auto">自动分配</option>
+                </select>
+                <div class="flex flex-wrap gap-1 mb-2" id="selectionQuickActions">
+                    <button onclick="applySelectionQuick('润色这段文字，使表达更学术')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg text-[10px]">润色</button>
+                    <button onclick="applySelectionQuick('精简这段文字，压缩约30%')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg text-[10px]">精简</button>
+                    <button onclick="applySelectionQuick('扩写这段文字，补充论证层次')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg text-[10px]">扩写</button>
+                    <button onclick="applySelectionQuick('把这段改写为更严谨的学术表述')" class="px-2 py-1 bg-slate-100 hover:bg-slate-200 rounded-lg text-[10px]">更严谨</button>
+                </div>
+                <textarea id="selectionInstruction" rows="2" placeholder="输入自然语言命令，例如：把这段改成三句话，并加上转折" class="w-full bg-slate-100 border-none rounded-xl p-2 text-[11px] resize-none outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+                <div class="flex gap-2 mt-2">
+                    <button id="selectionApplyBtn" onclick="runSelectionEdit()" class="flex-1 bg-indigo-600 text-white rounded-xl py-2 text-[11px] font-bold hover:bg-indigo-700">应用修改</button>
+                    <button onclick="hideSelectionMenu()" class="px-3 bg-slate-100 text-slate-600 rounded-xl py-2 text-[11px] font-bold hover:bg-slate-200">取消</button>
                 </div>
             </div>
         </section>

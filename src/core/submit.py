@@ -1,16 +1,19 @@
 """论文投递 — 期刊推荐 + 格式检查 + 格式修改"""
 import hashlib
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional
 
+from config.settings import LLM_MODEL
+
 logger = logging.getLogger(__name__)
 
-# Fixed model for the submission pipeline — user requirement: GLM-4.7.
-# Passed explicitly to llm_client so the default model can change without
-# silently affecting journal recommendations.
-_SUBMIT_MODEL = "glm-4.7"
+# 投递链路使用的模型：默认跟随全局 LLM_MODEL，可用 SUBMIT_MODEL 单独覆盖。
+# 此前硬编码 glm-4.7，与部署的 LLM_MODEL=glm-4-flash 不一致，容易出现
+# "主链路能跑、投递链路 404/超时" 的割裂问题。
+_SUBMIT_MODEL = os.getenv("SUBMIT_MODEL", "") or LLM_MODEL
 
 # In-process TTL cache (small, hot). SQLite (project_memory.cache_*) holds
 # the persistent copy so restarts don't blow away user-visible state.
@@ -233,6 +236,7 @@ def recommend_journals(
     # 1. 获取论文内容
     sections = project_memory.get_unique_sections(project_id)
     if not sections:
+        logger.info(f"recommend_journals: project {project_id} has no sections")
         return []
 
     paper_parts = []
@@ -362,12 +366,17 @@ def check_format(
 ) -> dict:
     """格式检查：对比论文内容与目标期刊要求"""
     from src.core.memory import project_memory
-    from src.core.llm import llm_client
+    from src.core.llm import llm_client, LLMError
 
     # 1. 获取论文内容
     sections = project_memory.get_unique_sections(project_id)
     if not sections:
-        return {"journal_name": journal_name, "requirements_summary": "未找到论文内容", "checklist": []}
+        return {
+            "journal_name": journal_name,
+            "requirements_summary": "该项目还没有任何章节内容",
+            "checklist": [],
+            "error": "格式检查需要先在「章节草稿」中生成至少一个章节，再回到投递中心检查格式",
+        }
 
     paper_parts = []
     for s in sections:
@@ -434,7 +443,7 @@ def apply_format_changes(
 ) -> dict:
     """应用选中的格式修改建议"""
     from src.core.memory import project_memory
-    from src.core.llm import llm_client
+    from src.core.llm import llm_client, LLMError
 
     # 1. 获取目标章节
     sections = project_memory.get_unique_sections(project_id)
@@ -458,17 +467,21 @@ def apply_format_changes(
     )
 
     # 3. LLM 修改内容
-    new_content = llm_client.chat(
-        [
-            {"role": "system", "content": "你是学术格式修改专家。只输出修改后的完整文本，不要加任何说明。"},
-            {"role": "user", "content": _FORMAT_APPLY_PROMPT.format(
-                section_content=section_content,
-                suggestions_text=suggestions_text,
-            )},
-        ],
-        temperature=0.3,
-        model=_SUBMIT_MODEL,
-    )
+    try:
+        new_content = llm_client.chat(
+            [
+                {"role": "system", "content": "你是学术格式修改专家。只输出修改后的完整文本，不要加任何说明。"},
+                {"role": "user", "content": _FORMAT_APPLY_PROMPT.format(
+                    section_content=section_content,
+                    suggestions_text=suggestions_text,
+                )},
+            ],
+            temperature=0.3,
+            model=_SUBMIT_MODEL,
+        )
+    except LLMError as e:
+        logger.warning(f"格式修改 LLM 调用失败: {e}")
+        return {"status": "error", "message": f"AI 修改失败：{e}"}
 
     if not new_content or not new_content.strip():
         return {"status": "error", "message": "AI 修改结果为空"}
